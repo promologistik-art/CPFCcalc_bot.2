@@ -1,7 +1,7 @@
 # parser.py
 import re
 from typing import List, Tuple, Optional
-from config import UNIT_TO_GRAMS, COMPOUND_CONJUNCTIONS
+from config import UNIT_TO_GRAMS, COMPOUND_SPLITTERS
 
 
 def extract_weight(text: str) -> Tuple[Optional[float], str]:
@@ -10,6 +10,7 @@ def extract_weight(text: str) -> Tuple[Optional[float], str]:
     Возвращает (вес_в_граммах, остаток_строки_без_веса)
     """
     text = text.strip()
+    original_text = text
     
     # Паттерны для поиска веса
     patterns = [
@@ -23,13 +24,12 @@ def extract_weight(text: str) -> Tuple[Optional[float], str]:
         (r'(тарелк[ауи]|миск[ауи]|чашк[ауи]|стакан[ау]?)', 'единица'),
     ]
     
-    best_match = None
     best_weight = None
     best_remaining = text
+    best_pattern_len = 0
     
     for pattern, unit_type in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
             weight_str = match.group(1) if len(match.groups()) > 0 else "1"
             try:
                 weight = float(weight_str)
@@ -55,11 +55,12 @@ def extract_weight(text: str) -> Tuple[Optional[float], str]:
             remaining = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
             remaining = re.sub(r'\s+', ' ', remaining).strip()
             
-            # Выбираем первое найденное или с наибольшим весом
-            if best_match is None:
-                best_match = pattern
+            # Выбираем наиболее подходящий результат (чем длиннее удалённый паттерн, тем лучше)
+            pattern_len = len(match.group(0))
+            if best_weight is None or pattern_len > best_pattern_len:
                 best_weight = weight
                 best_remaining = remaining
+                best_pattern_len = pattern_len
     
     if best_weight is not None:
         return best_weight, best_remaining
@@ -70,19 +71,23 @@ def extract_weight(text: str) -> Tuple[Optional[float], str]:
 def split_compound_dish(text: str) -> List[str]:
     """
     Разбивает составное блюдо на компоненты.
+    Возвращает список ингредиентов.
     """
     text = text.lower().strip()
+    if not text:
+        return []
     
-    # Ищем союзы
-    for conj in COMPOUND_CONJUNCTIONS:
-        pattern = rf'\b{conj}\b'
-        if re.search(pattern, text):
-            parts = re.split(pattern, text, maxsplit=1)
-            if len(parts) == 2:
-                left = parts[0].strip()
-                right = parts[1].strip()
-                if left and right:
-                    return [left, right]
+    # Пробуем разбить по каждому разделителю
+    for splitter in COMPOUND_SPLITTERS:
+        if splitter in text:
+            parts = text.split(splitter, 1)
+            left = parts[0].strip()
+            right = parts[1].strip()
+            
+            if left and right:
+                # Рекурсивно разбиваем правую часть
+                right_parts = split_compound_dish(right)
+                return [left] + right_parts
     
     return [text]
 
