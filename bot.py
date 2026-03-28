@@ -12,7 +12,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN
-from food_data import find_food, find_exact_food
+from food_data import find_food, find_exact_food, normalize_search_query
 from parser import parse_meal_input, format_nutrition, split_compound_dish
 from db import init_db, add_meal, get_day_stats, get_period_stats, get_daily_calories
 
@@ -30,11 +30,39 @@ init_db()
 
 # Состояния для FSM
 class ClarificationState(StatesGroup):
-    waiting_for_choice = State()
+    waiting_for_choice = State()  # Ожидание выбора из вариантов
+    waiting_for_manual_input = State()  # Ожидание ручного ввода (не используется, но оставлю)
 
 
 # Временное хранилище для неоднозначных поисков
 pending_searches: Dict[int, Dict] = {}
+
+
+async def finalize_meal(user_id: int, state: FSMContext, results: List[Tuple], message: Message):
+    """Завершает обработку приёма пищи и сохраняет в БД"""
+    await state.clear()
+    if user_id in pending_searches:
+        del pending_searches[user_id]
+    
+    # Сохраняем в БД
+    for name, protein, fat, carbs, calories, weight in results:
+        if not name.startswith("❌"):
+            # Восстанавливаем исходные КБЖУ на 100г для сохранения
+            orig_protein = protein * 100 / weight if weight > 0 else 0
+            orig_fat = fat * 100 / weight if weight > 0 else 0
+            orig_carbs = carbs * 100 / weight if weight > 0 else 0
+            orig_calories = calories * 100 / weight if weight > 0 else 0
+            add_meal(user_id, name, orig_protein, orig_fat, orig_carbs, orig_calories, weight)
+    
+    # Формируем ответ
+    meal_response = format_meal_response(results)
+    
+    # Получаем статистику за сегодня
+    today_stats = get_day_stats(user_id)
+    
+    # Отправляем ответ
+    await message.answer(meal_response, parse_mode="Markdown")
+    await message.answer(format_day_stats(today_stats), parse_mode="Markdown")
 
 
 async def process_food_item(
@@ -62,7 +90,7 @@ async def process_food_item(
         factor = weight / 100.0
         return (name, protein * factor, fat * factor, carbs * factor, calories * factor, weight)
     
-    # 3. Если несколько вариантов — сохраняем для уточнения (будет обработано отдельно)
+    # 3. Если несколько вариантов — сохраняем для уточнения
     if len(matches) > 1:
         return None  # Сигнал, что нужно уточнение
     
@@ -231,35 +259,107 @@ async def handle_clarification(message: Message, state: FSMContext):
     pending = search_data['pending']
     results = search_data['results']
     
-    # Проверяем, хочет ли пользователь пропустить или ввести своё
+    # Пользователь нажал "0" — пробуем найти с расширенным поиском
     if text.lower() in ['нет', 'пропустить', 'skip', '0']:
-        product_name, weight = pending[0]
+        product_name, weight, _ = pending[0]
+        
+        # Пробуем найти с расширенным поиском (убираем окончания)
+        normalized = normalize_search_query(product_name)
+        extended_matches = find_food(normalized)
+        
+        # Если расширенный поиск дал результаты — показываем новые варианты
+        if extended_matches and len(extended_matches) > 0:
+            # Сохраняем новые варианты в pending
+            pending[0] = (product_name, weight, extended_matches)
+            
+            msg = f"🔍 Попробуем поискать по-другому для \"{product_name}\":\n\n"
+            for i, (name, _, _, _, _) in enumerate(extended_matches[:10], 1):
+                msg += f"{i}. {name}\n"
+            msg += "\n0. Всё равно не то — попробовать разбить на составляющие\n"
+            msg += "Введите номер выбранного варианта:"
+            await message.answer(msg)
+            return
+        
+        # Если расширенный поиск не дал результатов — пробуем разбить на компоненты
+        components = split_compound_dish(product_name)
+        
+        if len(components) > 1:
+            # Распределяем вес между компонентами
+            component_weight = weight / len(components)
+            results_from_components = []
+            all_found = True
+            
+            for comp in components:
+                matches_comp = find_food(comp)
+                if matches_comp:
+                    # Берём первый подходящий вариант
+                    name, protein, fat, carbs, calories = matches_comp[0]
+                    factor = component_weight / 100.0
+                    results_from_components.append((
+                        name, protein * factor, fat * factor, carbs * factor, calories * factor, component_weight
+                    ))
+                else:
+                    all_found = False
+                    results_from_components.append((f"❌ {comp}", 0, 0, 0, 0, component_weight))
+            
+            if all_found:
+                # Успешно разбили на компоненты
+                pending.pop(0)
+                results.extend(results_from_components)
+                
+                # Переходим к следующему продукту или завершаем
+                if pending:
+                    next_product, next_weight, next_matches = pending[0]
+                    msg = f"🔍 Найдено несколько вариантов для \"{next_product}\":\n\n"
+                    for i, (name, _, _, _, _) in enumerate(next_matches[:10], 1):
+                        msg += f"{i}. {name}\n"
+                    msg += "\n0. Всё равно не то — попробовать разбить на составляющие\n"
+                    msg += "Введите номер выбранного варианта:"
+                    await message.answer(msg)
+                else:
+                    await finalize_meal(user_id, state, results, message)
+                return
+        
+        # Ничего не помогло — помечаем как не найденный
         results.append((f"❌ {product_name}", 0, 0, 0, 0, weight))
         pending.pop(0)
-    else:
-        try:
-            choice = int(text) - 1
-        except ValueError:
-            await message.answer(
-                "❌ Пожалуйста, введите номер варианта.\n"
-                "Или введите '0', чтобы пропустить этот продукт."
-            )
-            return
         
-        product_name, weight, matches = pending[0]
-        
-        if choice < 0 or choice >= len(matches):
-            await message.answer(
-                f"❌ Неверный номер. Введите число от 1 до {len(matches)}.\n"
-                "Или введите '0', чтобы пропустить этот продукт."
-            )
-            return
-        
-        selected = matches[choice]
-        factor = weight / 100.0
-        results.append((selected[0], selected[1] * factor, selected[2] * factor,
-                        selected[3] * factor, selected[4] * factor, weight))
-        pending.pop(0)
+        if pending:
+            next_product, next_weight, next_matches = pending[0]
+            msg = f"🔍 Найдено несколько вариантов для \"{next_product}\":\n\n"
+            for i, (name, _, _, _, _) in enumerate(next_matches[:10], 1):
+                msg += f"{i}. {name}\n"
+            msg += "\n0. Всё равно не то — попробовать разбить на составляющие\n"
+            msg += "Введите номер выбранного варианта:"
+            await message.answer(msg)
+        else:
+            await finalize_meal(user_id, state, results, message)
+        return
+    
+    # Обработка выбора номера
+    try:
+        choice = int(text) - 1
+    except ValueError:
+        await message.answer(
+            "❌ Пожалуйста, введите номер варианта.\n"
+            "Или введите '0', чтобы попробовать найти по-другому."
+        )
+        return
+    
+    product_name, weight, matches = pending[0]
+    
+    if choice < 0 or choice >= len(matches):
+        await message.answer(
+            f"❌ Неверный номер. Введите число от 1 до {len(matches)}.\n"
+            "Или введите '0', чтобы попробовать найти по-другому."
+        )
+        return
+    
+    selected = matches[choice]
+    factor = weight / 100.0
+    results.append((selected[0], selected[1] * factor, selected[2] * factor,
+                    selected[3] * factor, selected[4] * factor, weight))
+    pending.pop(0)
     
     if pending:
         # Ещё есть неоднозначные продукты
@@ -267,33 +367,12 @@ async def handle_clarification(message: Message, state: FSMContext):
         msg = f"🔍 Найдено несколько вариантов для \"{next_product}\":\n\n"
         for i, (name, _, _, _, _) in enumerate(next_matches[:10], 1):
             msg += f"{i}. {name}\n"
-        msg += "\n0. Нет в списке — пропустить\n"
+        msg += "\n0. Всё равно не то — попробовать разбить на составляющие\n"
         msg += "Введите номер выбранного варианта:"
         await message.answer(msg)
     else:
         # Все продукты обработаны
-        await state.clear()
-        del pending_searches[user_id]
-        
-        # Сохраняем в БД
-        for name, protein, fat, carbs, calories, weight in results:
-            if not name.startswith("❌"):
-                # Восстанавливаем исходные КБЖУ на 100г для сохранения
-                orig_protein = protein * 100 / weight if weight > 0 else 0
-                orig_fat = fat * 100 / weight if weight > 0 else 0
-                orig_carbs = carbs * 100 / weight if weight > 0 else 0
-                orig_calories = calories * 100 / weight if weight > 0 else 0
-                add_meal(user_id, name, orig_protein, orig_fat, orig_carbs, orig_calories, weight)
-        
-        # Формируем ответ
-        meal_response = format_meal_response(results)
-        
-        # Получаем статистику за сегодня
-        today_stats = get_day_stats(user_id)
-        
-        # Отправляем ответ
-        await message.answer(meal_response, parse_mode="Markdown")
-        await message.answer(format_day_stats(today_stats), parse_mode="Markdown")
+        await finalize_meal(user_id, state, results, message)
 
 
 @dp.message()
@@ -307,7 +386,7 @@ async def handle_meal(message: Message, state: FSMContext):
     if current_state == ClarificationState.waiting_for_choice:
         await message.answer(
             "⏳ Сначала ответьте на предыдущий вопрос о продукте.\n"
-            "Введите номер варианта или '0' чтобы пропустить.\n"
+            "Введите номер варианта или '0' чтобы попробовать найти по-другому.\n"
             "Или введите /cancel для отмены."
         )
         return
@@ -350,7 +429,7 @@ async def handle_meal(message: Message, state: FSMContext):
         msg = f"🔍 Найдено несколько вариантов для \"{first_product}\":\n\n"
         for i, (name, _, _, _, _) in enumerate(first_matches[:10], 1):
             msg += f"{i}. {name}\n"
-        msg += "\n0. Нет в списке — пропустить\n"
+        msg += "\n0. Всё равно не то — попробовать разбить на составляющие\n"
         msg += "Введите номер выбранного варианта:"
         await message.answer(msg)
         return
