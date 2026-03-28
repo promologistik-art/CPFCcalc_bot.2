@@ -16,6 +16,131 @@ from food_data import find_food, find_exact_food
 from parser import parse_meal_input, format_nutrition
 from db import init_db, add_meal, get_day_stats, get_period_stats, get_daily_calories
 
+# Глобальный словарь для хранения ожидающих уточнений
+pending_searches: Dict[int, Dict] = {}
+
+
+# Добавляем хендлер для /start и /cancel в состоянии уточнения
+@dp.message(ClarificationState.waiting_for_choice, Command("start"))
+async def cmd_start_in_clarification(message: Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id in pending_searches:
+        del pending_searches[message.from_user.id]
+    await cmd_start(message)
+
+
+@dp.message(ClarificationState.waiting_for_choice, Command("cancel"))
+async def cmd_cancel_in_clarification(message: Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id in pending_searches:
+        del pending_searches[message.from_user.id]
+    await message.answer("❌ Ввод отменён. Можете начать заново.")
+
+
+@dp.message(ClarificationState.waiting_for_choice)
+async def handle_clarification(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    if user_id not in pending_searches:
+        await state.clear()
+        await message.answer("⏳ Сеанс уточнения истёк. Напишите продукты заново.")
+        return
+    
+    search_data = pending_searches[user_id]
+    pending = search_data['pending']
+    results = search_data['results']
+    
+    # Проверяем, хочет ли пользователь пропустить
+    if text.lower() in ['нет', 'пропустить', 'skip', '0']:
+        product_name, weight, _ = pending[0]
+        results.append((f"❌ {product_name}", 0, 0, 0, 0, weight))
+        pending.pop(0)
+    else:
+        try:
+            choice = int(text) - 1
+        except ValueError:
+            await message.answer("❌ Пожалуйста, введите номер варианта или '0' чтобы пропустить.")
+            return
+        
+        if choice < 0 or choice >= len(pending[0][2]):
+            await message.answer("❌ Неверный номер. Попробуйте снова.")
+            return
+        
+        product_name, weight, matches = pending[0]
+        selected = matches[choice]
+        
+        factor = weight / 100.0
+        results.append((selected[0], selected[1] * factor, selected[2] * factor,
+                        selected[3] * factor, selected[4] * factor, weight))
+        pending.pop(0)
+    
+    if pending:
+        next_product, next_weight, next_matches = pending[0]
+        msg = f"🔍 Найдено несколько вариантов для \"{next_product}\":\n\n"
+        for i, (name, _, _, _, _) in enumerate(next_matches[:10], 1):
+            msg += f"{i}. {name}\n"
+        msg += "\n0. Нет моего варианта (пропустить)\n"
+        msg += "Введите номер выбранного варианта."
+        await message.answer(msg)
+    else:
+        await state.clear()
+        del pending_searches[user_id]
+        
+        # Сохраняем в БД
+        for name, protein, fat, carbs, calories, weight in results:
+            if not name.startswith("❌"):
+                orig_protein = protein * 100 / weight if weight > 0 else 0
+                orig_fat = fat * 100 / weight if weight > 0 else 0
+                orig_carbs = carbs * 100 / weight if weight > 0 else 0
+                orig_calories = calories * 100 / weight if weight > 0 else 0
+                add_meal(user_id, name, orig_protein, orig_fat, orig_carbs, orig_calories, weight)
+        
+        meal_response = format_meal_response(results)
+        today_stats = get_day_stats(user_id)
+        
+        await message.answer(meal_response, parse_mode="Markdown")
+        await message.answer(format_day_stats(today_stats), parse_mode="Markdown")
+
+
+# Обновляем основной хендлер сообщений — добавляем проверку состояния
+@dp.message()
+async def handle_meal(message: Message, state: FSMContext):
+    """Обрабатывает сообщения с едой"""
+    current_state = await state.get_state()
+    
+    # Если мы в процессе уточнения, не начинаем новый ввод
+    if current_state == ClarificationState.waiting_for_choice:
+        await message.answer("⏳ Сначала ответьте на предыдущий вопрос о продукте.\nИли введите /cancel для отмены.")
+        return
+    
+    user_id = message.from_user.id
+    text = message.text
+    
+    # Очищаем старые данные если есть
+    if user_id in pending_searches:
+        del pending_searches[user_id]
+    
+    results = await process_meal(user_id, text, state)
+    
+    if results is None:
+        return
+    
+    # Сохраняем в БД
+    for name, protein, fat, carbs, calories, weight in results:
+        if not name.startswith("❌"):
+            orig_protein = protein * 100 / weight if weight > 0 else 0
+            orig_fat = fat * 100 / weight if weight > 0 else 0
+            orig_carbs = carbs * 100 / weight if weight > 0 else 0
+            orig_calories = calories * 100 / weight if weight > 0 else 0
+            add_meal(user_id, name, orig_protein, orig_fat, orig_carbs, orig_calories, weight)
+    
+    meal_response = format_meal_response(results)
+    today_stats = get_day_stats(user_id)
+    
+    await message.answer(meal_response, parse_mode="Markdown")
+    await message.answer(format_day_stats(today_stats), parse_mode="Markdown")
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
